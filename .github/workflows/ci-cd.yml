@@ -1,0 +1,97 @@
+name: End-to-End CI/CD Pipeline
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+    branches: [ "main" ]
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # 1. CI FÁZIS: Unit és integrációs tesztek futtatása
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Forráskód letöltése
+        uses: actions/checkout@v4
+
+      - name: Python környezet beállítása
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Függőségek telepítése
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Pytest futtatása
+        run: pytest -v
+
+  # 2. CI FÁZIS: Docker Artifact buildelése és feltöltése Registry-be
+  build-and-push:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Forráskód letöltése
+        uses: actions/checkout@v4
+
+      - name: Repository név kisbetűsítése (Docker szabvány)
+        id: meta
+        run: echo "repo_lower=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+
+      - name: Bejelentkezés a GitHub Container Registry-be
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Docker image build és push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/${{ steps.meta.outputs.repo_lower }}:latest
+            ${{ env.REGISTRY }}/${{ steps.meta.outputs.repo_lower }}:${{ github.sha }}
+
+  # 3. CD FÁZIS: Automatikus telepítés a Sandbox környezetbe
+  deploy:
+    needs: build-and-push
+    runs-on: self-hosted
+    steps:
+      - name: Repository név kisbetűsítése
+        id: meta
+        run: echo "repo_lower=${GITHUB_REPOSITORY,,}" >> $GITHUB_OUTPUT
+
+      - name: Bejelentkezés a Registry-be a szerveren
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u ${{ github.actor }} --password-stdin
+
+      - name: Legfrissebb artifact letöltése
+        run: docker pull ${{ env.REGISTRY }}/${{ steps.meta.outputs.repo_lower }}:latest
+
+      - name: Korábbi konténer leállítása és törlése
+        run: |
+          docker stop devops-mini-app || true
+          docker rm devops-mini-app || true
+
+      - name: Új konténer indítása
+        run: |
+          docker run -d \
+            --name devops-mini-app \
+            --restart unless-stopped \
+            -p 8000:8000 \
+            ${{ env.REGISTRY }}/${{ steps.meta.outputs.repo_lower }}:latest
+
+      - name: Post-deploy ellenőrzés (Smoke test)
+        run: |
+          sleep 3
+          curl --fail http://localhost:8000/health
